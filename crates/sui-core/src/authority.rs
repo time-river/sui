@@ -9,6 +9,7 @@ use crate::execution_cache::TransactionCacheRead;
 use crate::jsonrpc_index::CoinIndexKey2;
 use crate::rpc_index::RpcIndexStore;
 use crate::transaction_outputs::TransactionOutputs;
+use crate::tx_handler::TxHandler;
 use crate::verify_indexes::{fix_indexes, verify_indexes};
 use anyhow::anyhow;
 use arc_swap::{ArcSwap, Guard};
@@ -857,6 +858,9 @@ pub struct AuthorityState {
     chain_identifier: ChainIdentifier,
 
     pub(crate) congestion_tracker: Arc<CongestionTracker>,
+
+    /// Handle to send transaction effects and events to the tx handler
+    tx_handler: TxHandler,
 }
 
 /// The authority state encapsulates all state, drives execution, and ensures safety.
@@ -1552,6 +1556,34 @@ impl AuthorityState {
         _execution_guard: ExecutionLockReadGuard<'_>,
         epoch_store: &Arc<AuthorityPerEpochStore>,
     ) -> SuiResult {
+        let sui_events: Vec<SuiEvent> = {
+            let raw_events = inner_temporary_store.events.clone();
+
+            raw_events
+                .data
+                .iter()
+                .enumerate()
+                .map(|(seq, event)| {
+                    let mut layout_resolver = epoch_store.executor().type_layout_resolver(
+                        Box::new(
+                            PackageStoreWithFallback::new(
+                                &inner_temporary_store,
+                                self.get_backing_package_store(),
+                            ),
+                        )
+                    );
+                    let layout = layout_resolver.get_annotated_layout(&event.type_)?;
+                    SuiEvent::try_from(
+                        event.clone(),
+                        *certificate.digest(),
+                        seq as u64,
+                        None,
+                        layout,
+                    )
+                })
+                .collect::<Result<_, _>>()?
+        };
+
         let _scope: Option<mysten_metrics::MonitoredScopeGuard> =
             monitored_scope("Execution::commit_certificate");
         let _metrics_guard = self.metrics.commit_certificate_latency.start_timer();
@@ -1578,13 +1610,13 @@ impl AuthorityState {
         // Allow testing what happens if we crash here.
         fail_point!("crash");
 
-        let transaction_outputs = TransactionOutputs::build_transaction_outputs(
+        let transaction_outputs = Arc::new(TransactionOutputs::build_transaction_outputs(
             certificate.clone().into_unsigned(),
             effects.clone(),
             inner_temporary_store,
-        );
+        ));
         self.get_cache_writer()
-            .write_transaction_outputs(epoch_store.epoch(), transaction_outputs.into());
+            .write_transaction_outputs(epoch_store.epoch(), transaction_outputs.clone());
 
         if certificate.transaction_data().is_end_of_epoch_tx() {
             // At the end of epoch, since system packages may have been upgraded, force
@@ -1595,6 +1627,12 @@ impl AuthorityState {
 
         // commit_certificate finished, the tx is fully committed to the store.
         tx_guard.commit_tx();
+
+        if !certificate.transaction_data().is_system_tx()
+            && !sui_events.is_empty()
+            && !transaction_outputs.written.is_empty() {
+                let _ = self.tx_handler.send_tx_effects_and_events(effects, sui_events);
+        }
 
         // Notifies transaction manager about transaction and output objects committed.
         // This provides necessary information to transaction manager to start executing
@@ -2975,6 +3013,7 @@ impl AuthorityState {
             validator_tx_finalizer,
             chain_identifier,
             congestion_tracker: Arc::new(CongestionTracker::new()),
+            tx_handler: TxHandler::default(),
         });
 
         let state_clone = Arc::downgrade(&state);
