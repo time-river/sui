@@ -122,8 +122,17 @@ impl ExecutionCacheMetrics {
             .inc();
     }
 
-    pub(crate) fn record_cache_miss(&self, request_type: &'static str, level: &'static str) {
+    pub(crate) fn record_cache_miss(&self, request_type: &'static str, level: &'static str, object_id: Option<&sui_types::base_types::ObjectID>) {
         trace!(target: "cache_metrics", "Cache miss: {} {}", request_type, level);
+        if let Some(object_id) = object_id {
+            const MOCK_IDS: [&str; 2] = [
+                "0x0000000000000000000000000000000000000000000000000000000000001337", // mocked gas id, used in db_simulator
+                "0x0000000000000000000000000000000000000000000000000000000000001338", // mocked sui coin, used in defi
+            ];
+            if MOCK_IDS.contains(&object_id.to_string().as_str()) {
+                tracing::info!(target: "cache_metrics", "Cache miss: {} {} object_id: {}", request_type, level, object_id);
+            }
+        }
         self.cache_misses
             .with_label_values(&[request_type, level])
             .inc();
@@ -146,5 +155,18 @@ impl ExecutionCacheMetrics {
 
     pub(crate) fn record_ticket_expiry(&self) {
         self.expired_tickets.inc();
+    }
+
+    pub fn cache_misses_count(&self) -> u64 {
+        [
+            ["object_latest", "committed"],
+            ["object_latest", "uncommitted"],
+            ["object_latest", "object_by_id"],
+            ["package", "uncommitted"],
+            ["package", "committed"],
+        ]
+        .iter()
+        .map(|label| self.cache_misses.with_label_values(label).get())
+        .sum()
     }
 }
