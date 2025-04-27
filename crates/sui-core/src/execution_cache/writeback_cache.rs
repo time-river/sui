@@ -94,6 +94,13 @@ use super::{
     ExecutionCacheWrite, ObjectCacheRead, StateSyncAPI, TestingAPI, TransactionCacheRead,
 };
 
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::sync::{OnceLock, Mutex as StdMutex};
+use typed_store::Map;
+use crate::cache_update_handler::{load_poll_related_ids, POOL_RELATED_OBJECTS_PATH};
+use dashmap::DashSet;
+
 #[cfg(test)]
 #[path = "unit_tests/writeback_cache_tests.rs"]
 pub mod writeback_cache_tests;
@@ -395,6 +402,18 @@ impl CachedCommittedData {
         assert!(self.executed_effects_digests.is_empty());
         assert_empty(&self._transaction_objects);
     }
+
+    // private API, used in `WritebackCache::update_underlying()`
+    fn clear(&self) {
+        self.object_cache.invalidate_all();
+        self.object_by_id_cache.invalidate_all();
+        self.marker_cache.invalidate_all();
+        self.transactions.invalidate_all();
+        self.transaction_effects.invalidate_all();
+        self.transaction_events.invalidate_all();
+        self.executed_effects_digests.invalidate_all();
+        self._transaction_objects.invalidate_all();
+    }
 }
 
 fn assert_empty<K, V>(cache: &MokaCache<K, V>)
@@ -406,6 +425,41 @@ where
         panic!("cache should be empty");
     }
 }
+
+struct PoolRelatedState {
+    related_ids: DashSet<ObjectID>,
+    file_handler: StdMutex<File>,
+}
+
+// TODO: async method
+impl PoolRelatedState {
+    fn new() -> Self {
+        let pool_related_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(POOL_RELATED_OBJECTS_PATH)
+            .expect("Failed to open file {POOL_RELATED_OBJECTS_PATH}");
+
+        Self {
+            related_ids: load_poll_related_ids(),
+            file_handler: StdMutex::new(pool_related_file),
+        }
+    }
+
+    fn record_pool_related_id(&self, object_id: &ObjectID) {
+        if !self.related_ids.contains(object_id) {
+            self.related_ids.insert(*object_id);
+
+            if let Ok(mut file) = self.file_handler.lock() {
+                let _ = writeln!(file, "{}", object_id);
+            }
+        }
+    }
+}
+
+static POOL_RELATED_STATE: OnceLock<PoolRelatedState> = OnceLock::new();
+const ENABLE_RECORD_POOL_RELATED_ID: &str = "__ENABLE_RECORD_POOL_RELATED_ID__";
 
 pub struct WritebackCache {
     dirty: UncommittedData,
@@ -430,10 +484,12 @@ pub struct WritebackCache {
     backpressure_threshold: u64,
     backpressure_manager: Arc<BackpressureManager>,
     metrics: Arc<ExecutionCacheMetrics>,
+
+    enable_record_pool_ids: bool,
 }
 
 macro_rules! check_cache_entry_by_version {
-    ($self: ident, $table: expr, $level: expr, $cache: expr, $version: expr) => {
+    ($self: ident, $table: expr, $level: expr, $cache: expr, $version: expr, $object_id: expr) => {
         $self.metrics.record_cache_request($table, $level);
         if let Some(cache) = $cache {
             if let Some(entry) = cache.get(&$version) {
@@ -450,12 +506,12 @@ macro_rules! check_cache_entry_by_version {
                 }
             }
         }
-        $self.metrics.record_cache_miss($table, $level);
+        $self.record_cache_miss($table, $level, Some(&$object_id));
     };
 }
 
 macro_rules! check_cache_entry_by_latest {
-    ($self: ident, $table: expr, $level: expr, $cache: expr) => {
+    ($self: ident, $table: expr, $level: expr, $cache: expr, $object_id: expr) => {
         $self.metrics.record_cache_request($table, $level);
         if let Some(cache) = $cache {
             if let Some((version, entry)) = cache.get_highest() {
@@ -465,7 +521,7 @@ macro_rules! check_cache_entry_by_latest {
                 panic!("empty CachedVersionMap should have been removed");
             }
         }
-        $self.metrics.record_cache_miss($table, $level);
+        $self.record_cache_miss($table, $level, Some(&$object_id));
     };
 }
 
@@ -491,6 +547,7 @@ impl WritebackCache {
             backpressure_manager,
             backpressure_threshold: config.backpressure_threshold(),
             metrics,
+            enable_record_pool_ids: std::env::var(ENABLE_RECORD_POOL_RELATED_ID).is_ok(),
         }
     }
 
@@ -617,14 +674,16 @@ impl WritebackCache {
                     "object_by_version",
                     "uncommitted",
                     dirty_entry,
-                    version
+                    version,
+                    object_id
                 );
                 check_cache_entry_by_version!(
                     self,
                     "object_by_version",
                     "committed",
                     cached_entry,
-                    version
+                    version,
+                    object_id
                 );
                 CacheResult::Miss
             },
@@ -711,7 +770,7 @@ impl WritebackCache {
                 }
             }
         } else {
-            self.metrics.record_cache_miss(request_type, "object_by_id");
+            self.record_cache_miss(request_type, "object_by_id", Some(object_id));
         }
 
         Self::with_locked_cache_entries(
@@ -719,8 +778,8 @@ impl WritebackCache {
             &self.cached.object_cache,
             object_id,
             |dirty_entry, cached_entry| {
-                check_cache_entry_by_latest!(self, request_type, "uncommitted", dirty_entry);
-                check_cache_entry_by_latest!(self, request_type, "committed", cached_entry);
+                check_cache_entry_by_latest!(self, request_type, "uncommitted", dirty_entry, object_id);
+                check_cache_entry_by_latest!(self, request_type, "committed", cached_entry, object_id);
                 CacheResult::Miss
             },
         )
@@ -751,19 +810,22 @@ impl WritebackCache {
             &self.cached.marker_cache,
             &(epoch_id, object_key.id()),
             |dirty_entry, cached_entry| {
+                let object_id = object_key.id().id();
                 check_cache_entry_by_version!(
                     self,
                     "marker_by_version",
                     "uncommitted",
                     dirty_entry,
-                    object_key.version()
+                    object_key.version(),
+                    object_id
                 );
                 check_cache_entry_by_version!(
                     self,
                     "marker_by_version",
                     "committed",
                     cached_entry,
-                    object_key.version()
+                    object_key.version(),
+                    object_id
                 );
                 CacheResult::Miss
             },
@@ -780,8 +842,9 @@ impl WritebackCache {
             &self.cached.marker_cache,
             &(epoch_id, object_id),
             |dirty_entry, cached_entry| {
-                check_cache_entry_by_latest!(self, "marker_latest", "uncommitted", dirty_entry);
-                check_cache_entry_by_latest!(self, "marker_latest", "committed", cached_entry);
+                let object_id = object_id.id();
+                check_cache_entry_by_latest!(self, "marker_latest", "uncommitted", dirty_entry, object_id);
+                check_cache_entry_by_latest!(self, "marker_latest", "committed", cached_entry, object_id);
                 CacheResult::Miss
             },
         )
@@ -1272,6 +1335,49 @@ impl WritebackCache {
         self.packages.invalidate_all();
         assert_empty(&self.packages);
     }
+
+    async fn update_package_cache(&self, package_updates:&[(ObjectID, Object)]) -> SuiResult {
+        for (package_id, object) in package_updates {
+            self.packages
+                .insert(*package_id, PackageObject::new(object.clone()));
+        }
+
+        Ok(())
+    }
+
+    pub fn reload_cached(&self, objects: Vec<(ObjectID, Object)>) {
+        for (object_id, object) in objects {
+            let _ = self.cached.object_by_id_cache.insert(
+                &object_id,
+                LatestObjectCacheEntry::Object(object.version(), object.into()),
+                Ticket::Write,
+            );
+        }
+    }
+
+    pub fn clear(&self) {
+        self.cached.clear();
+    }
+
+    fn record_cache_miss(
+        &self,
+        table: &'static str,
+        level: &'static str,
+        object_id: Option<&ObjectID>,
+    ) {
+        self.metrics.record_cache_miss(table, level, object_id);
+        if let Some(object_id) = object_id {
+            self.record_pool_related_id(object_id);
+        }
+    }
+
+    fn record_pool_related_id(&self, object_id: &ObjectID) {
+        if self.enable_record_pool_ids {
+            POOL_RELATED_STATE
+                .get_or_init(PoolRelatedState::new)
+                .record_pool_related_id(object_id);
+        }
+    }
 }
 
 impl ExecutionCacheAPI for WritebackCache {}
@@ -1327,7 +1433,7 @@ impl ObjectCacheRead for WritebackCache {
             self.metrics.record_cache_hit("package", "package_cache");
             return Ok(Some(p));
         } else {
-            self.metrics.record_cache_miss("package", "package_cache");
+            self.metrics.record_cache_miss("package", "package_cache", Some(&package_id));
         }
 
         // We try the dirty objects cache as well before going to the database. This is necessary
@@ -1496,7 +1602,7 @@ impl ObjectCacheRead for WritebackCache {
                         }
                     } else {
                         self.metrics
-                            .record_cache_miss("object_lt_or_eq_version", $level);
+                            .record_cache_miss("object_lt_or_eq_version", $level, Some(&object_id));
                     }
                 }
             };
@@ -1535,7 +1641,7 @@ impl ObjectCacheRead for WritebackCache {
             }
         }
         self.metrics
-            .record_cache_miss("object_lt_or_eq_version", "object_by_id");
+            .record_cache_miss("object_lt_or_eq_version", "object_by_id", Some(&object_id));
 
         Self::with_locked_cache_entries(
             &self.dirty.objects,
@@ -1786,8 +1892,7 @@ impl TransactionCacheRead for WritebackCache {
                         .record_cache_hit("transaction_block", "uncommitted");
                     return CacheResult::Hit(Some(tx.transaction.clone()));
                 }
-                self.metrics
-                    .record_cache_miss("transaction_block", "uncommitted");
+                self.record_cache_miss("transaction_block", "uncommitted", None);
 
                 self.metrics
                     .record_cache_request("transaction_block", "committed");
@@ -1806,7 +1911,7 @@ impl TransactionCacheRead for WritebackCache {
                     Some(PointCacheItem::None) => CacheResult::NegativeHit,
                     None => {
                         self.metrics
-                            .record_cache_miss("transaction_block", "committed");
+                            .record_cache_miss("transaction_block", "committed", None);
 
                         CacheResult::Miss
                     }
@@ -1854,8 +1959,7 @@ impl TransactionCacheRead for WritebackCache {
                         .record_cache_hit("executed_effects_digests", "uncommitted");
                     return CacheResult::Hit(Some(*digest));
                 }
-                self.metrics
-                    .record_cache_miss("executed_effects_digests", "uncommitted");
+                self.record_cache_miss("executed_effects_digests", "uncommitted", None);
 
                 self.metrics
                     .record_cache_request("executed_effects_digests", "committed");
@@ -1873,7 +1977,7 @@ impl TransactionCacheRead for WritebackCache {
                     Some(PointCacheItem::None) => CacheResult::NegativeHit,
                     None => {
                         self.metrics
-                            .record_cache_miss("executed_effects_digests", "committed");
+                            .record_cache_miss("executed_effects_digests", "committed", None);
                         CacheResult::Miss
                     }
                 }
@@ -1916,7 +2020,7 @@ impl TransactionCacheRead for WritebackCache {
                     return CacheResult::Hit(Some(effects.clone()));
                 }
                 self.metrics
-                    .record_cache_miss("transaction_effects", "uncommitted");
+                    .record_cache_miss("transaction_effects", "uncommitted", None);
 
                 self.metrics
                     .record_cache_request("transaction_effects", "committed");
@@ -1934,7 +2038,7 @@ impl TransactionCacheRead for WritebackCache {
                     Some(PointCacheItem::None) => CacheResult::NegativeHit,
                     None => {
                         self.metrics
-                            .record_cache_miss("transaction_effects", "committed");
+                            .record_cache_miss("transaction_effects", "committed", None);
                         CacheResult::Miss
                     }
                 }
@@ -1996,8 +2100,7 @@ impl TransactionCacheRead for WritebackCache {
 
                     return CacheResult::Hit(map_events(events));
                 }
-                self.metrics
-                    .record_cache_miss("transaction_events", "uncommitted");
+                self.record_cache_miss("transaction_events", "uncommitted", None);
 
                 self.metrics
                     .record_cache_request("transaction_events", "committed");
@@ -2015,7 +2118,7 @@ impl TransactionCacheRead for WritebackCache {
                     Some(PointCacheItem::None) => CacheResult::NegativeHit,
                     None => {
                         self.metrics
-                            .record_cache_miss("transaction_events", "committed");
+                            .record_cache_miss("transaction_events", "committed", None);
 
                         CacheResult::Miss
                     }
@@ -2060,6 +2163,30 @@ impl ExecutionCacheWrite for WritebackCache {
 
     fn write_transaction_outputs(&self, epoch_id: EpochId, tx_outputs: Arc<TransactionOutputs>) {
         WritebackCache::write_transaction_outputs(self, epoch_id, tx_outputs);
+    }
+
+    fn update_package_cache<'a> (
+            &'a self,
+            package_updates: &'a [(ObjectID, Object)],
+         ) -> BoxFuture<'a, SuiResult> {
+            WritebackCache::update_package_cache(self, package_updates).boxed()
+    }
+
+    fn reload_objects(&self, objects: Vec<(ObjectID, Object)>) {
+        self.reload_cached(objects);
+    }
+
+    // public API
+    fn update_underlying(&self, clear_cache: bool) {
+        self.store
+            .perpetual_tables
+            .objects
+            .try_catch_up_with_primary()
+            .unwrap();
+
+        if clear_cache {
+            self.clear();
+        }
     }
 }
 
