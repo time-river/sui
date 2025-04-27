@@ -50,6 +50,7 @@ use std::{
     sync::Arc,
     vec,
 };
+use std::str::FromStr;
 use sui_config::node::{AuthorityOverloadConfig, StateDebugDumpConfig};
 use sui_config::NodeConfig;
 use sui_protocol_config::PerObjectCongestionControlMode;
@@ -167,6 +168,9 @@ use crate::subscription_handler::SubscriptionHandler;
 use crate::transaction_input_loader::TransactionInputLoader;
 use crate::transaction_manager::TransactionManager;
 
+use dashmap::DashSet;
+use crate::cache_update_handler::{load_poll_related_ids, CacheUpdateHandler};
+
 #[cfg(msim)]
 pub use crate::checkpoints::checkpoint_executor::utils::{
     init_checkpoint_timeout_config, CheckpointTimeoutConfig,
@@ -179,6 +183,17 @@ use crate::validator_tx_finalizer::ValidatorTxFinalizer;
 use sui_types::committee::CommitteeTrait;
 use sui_types::deny_list_v2::check_coin_deny_list_v2_during_signing;
 use sui_types::execution_config_utils::to_binary_config;
+
+use std::sync::LazyLock;
+const OUR_OBJECT: LazyLock<ObjectID> = LazyLock::new(|| {
+    const OWNER_SUI_ADDRESS_ENV: &str = "__SUI_OWNER_SUI_ADDRESS__";
+
+    let obj = ObjectID::from_str(
+        &std::env::var(OWNER_SUI_ADDRESS_ENV).expect("NO __SUI_OWNER_SUI_ADDRESS__ env var")
+    ).expect("__SUI_OWNER_SUI_ADDRESS__ env var is not a valid ObjectID");
+
+    obj
+});
 
 #[cfg(test)]
 #[path = "unit_tests/authority_tests.rs"]
@@ -861,6 +876,9 @@ pub struct AuthorityState {
 
     /// Handle to send transaction effects and events to the tx handler
     tx_handler: TxHandler,
+
+    pool_related_ids: DashSet<ObjectID>,
+    cache_update_handler: CacheUpdateHandler,
 }
 
 /// The authority state encapsulates all state, drives execution, and ensures safety.
@@ -1615,8 +1633,29 @@ impl AuthorityState {
             effects.clone(),
             inner_temporary_store,
         ));
+        // Here update cache
         self.get_cache_writer()
             .write_transaction_outputs(epoch_store.epoch(), transaction_outputs.clone());
+
+        // if system tx, skip
+        if !certificate.transaction_data().is_system_tx() {
+            let changed_objects: Vec<_> = transaction_outputs
+                .written
+                .iter()
+                .map(|(id, obj)| (*id, obj.clone()))
+                .collect();
+
+            // if no changed objects, skip
+            if !changed_objects.is_empty() {
+                let need_notify = changed_objects.iter().any(|(id, obj)| {
+                    obj.owner() == &*OUR_OBJECT || self.pool_related_ids.contains(id)
+                });
+
+                if need_notify {
+                    let _ = self.cache_update_handler.notify_written(changed_objects);
+                }
+            }
+        }
 
         if certificate.transaction_data().is_end_of_epoch_tx() {
             // At the end of epoch, since system packages may have been upgraded, force
@@ -3014,6 +3053,8 @@ impl AuthorityState {
             chain_identifier,
             congestion_tracker: Arc::new(CongestionTracker::new()),
             tx_handler: TxHandler::default(),
+            pool_related_ids: load_poll_related_ids(),
+            cache_update_handler: CacheUpdateHandler::default(),
         });
 
         let state_clone = Arc::downgrade(&state);
