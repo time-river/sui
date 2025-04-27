@@ -480,7 +480,7 @@ pub struct WritebackCache {
     object_locks: ObjectLocks,
 
     executed_effects_digests_notify_read: NotifyRead<TransactionDigest, TransactionEffectsDigest>,
-    store: Arc<AuthorityStore>,
+    pub store: Arc<AuthorityStore>,
     backpressure_threshold: u64,
     backpressure_manager: Arc<BackpressureManager>,
     metrics: Arc<ExecutionCacheMetrics>,

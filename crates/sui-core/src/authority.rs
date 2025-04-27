@@ -168,6 +168,7 @@ use crate::subscription_handler::SubscriptionHandler;
 use crate::transaction_input_loader::TransactionInputLoader;
 use crate::transaction_manager::TransactionManager;
 
+pub use authority_store::SuiLockResult;
 use dashmap::DashSet;
 use crate::cache_update_handler::{load_poll_related_ids, CacheUpdateHandler};
 

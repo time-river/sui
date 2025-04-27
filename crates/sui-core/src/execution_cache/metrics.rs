@@ -8,6 +8,11 @@ use prometheus::{
     register_int_gauge_with_registry, IntCounter, IntCounterVec, IntGauge, Registry,
 };
 
+pub const MOCK_IDS: [&str; 2] = [
+    "0x0000000000000000000000000000000000000000000000000000000000001337", // mocked gas id, used in db_simulator
+    "0x0000000000000000000000000000000000000000000000000000000000001338", // mocked sui coin, used in defi
+];
+
 pub struct ExecutionCacheMetrics {
     pub(crate) pending_notify_read: IntGauge,
     pub(crate) cache_requests: IntCounterVec,
@@ -125,12 +130,8 @@ impl ExecutionCacheMetrics {
     pub(crate) fn record_cache_miss(&self, request_type: &'static str, level: &'static str, object_id: Option<&sui_types::base_types::ObjectID>) {
         trace!(target: "cache_metrics", "Cache miss: {} {}", request_type, level);
         if let Some(object_id) = object_id {
-            const MOCK_IDS: [&str; 2] = [
-                "0x0000000000000000000000000000000000000000000000000000000000001337", // mocked gas id, used in db_simulator
-                "0x0000000000000000000000000000000000000000000000000000000000001338", // mocked sui coin, used in defi
-            ];
             if MOCK_IDS.contains(&object_id.to_string().as_str()) {
-                tracing::info!(target: "cache_metrics", "Cache miss: {} {} object_id: {}", request_type, level, object_id);
+                tracing::debug!(target: "cache_metrics", "Cache miss: {} {} object_id: {}", request_type, level, object_id);
             }
         }
         self.cache_misses
